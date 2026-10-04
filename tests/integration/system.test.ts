@@ -25,6 +25,14 @@ let orm: MikroORM,
   app: INestApplication,
   base: string;
 const context = { correlationId: 'integration' };
+async function waitFor(check: () => Promise<boolean>, timeout = 10000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await Bun.sleep(50);
+  }
+  throw new Error('Timed out waiting for observed state');
+}
 async function wallet(amount = '100.00') {
   return service.createWallet(
     { playerId: crypto.randomUUID(), initialBalance: { amount, currency: 'BRL' } },
@@ -555,5 +563,315 @@ describe('Real SQS, inbox, outbox and crash recovery', () => {
         new DeleteMessageCommand({ QueueUrl: queues.dlq, ReceiptHandle: m.ReceiptHandle! }),
       );
     await consistent(w.id);
+  });
+});
+
+describe('Additional failure and audit guarantees', () => {
+  test('LOSS and rejection preserve version and emit no balance event', async () => {
+    const w = await wallet();
+    const loss = await submit(input(w, 'LOSS', '0.00'));
+    const rejected = await submit(input(w, 'BET', '101.00'));
+    expect(loss.status).toBe('PROCESSED');
+    expect(rejected.status).toBe('REJECTED');
+    expect((await service.getWallet(w.id)).version).toBe(1);
+    expect((await consistent(w.id)).checkedEntries).toBe(1);
+    const events = await orm.em.fork().execute<
+      {
+        event_type: string;
+        payload: {
+          eventId: string;
+          aggregateId: string;
+          version: number;
+          correlationId: string;
+          occurredAt: string;
+        };
+      }[]
+    >('SELECT event_type,payload FROM outbox WHERE aggregate_id=?', [w.id]);
+    expect(events.filter((e) => e.event_type === 'WalletBalanceChanged')).toHaveLength(1);
+    expect(events.filter((e) => e.event_type === 'WagerTransactionProcessed')).toHaveLength(2);
+    expect(events.filter((e) => e.event_type === 'WagerTransactionRejected')).toHaveLength(1);
+    for (const event of events) {
+      expect(event.payload.eventId).toBeTruthy();
+      expect(event.payload.aggregateId).toBe(w.id);
+      expect(event.payload.version).toBe(1);
+      expect(event.payload.correlationId).toBe(context.correlationId);
+      expect(Number.isFinite(Date.parse(event.payload.occurredAt))).toBe(true);
+    }
+  });
+  test('rejected replay remains rejected after a later credit', async () => {
+    const w = await wallet(),
+      p = input(w, 'BET', '101.00');
+    const original = await submit(p);
+    await submit(input(w, 'WIN', '50.00'));
+    expect(await submit(p)).toEqual({ ...original, idempotentReplay: true });
+    expect((await service.getWallet(w.id)).balance.amount).toBe('150.00');
+    expect((await consistent(w.id)).checkedEntries).toBe(2);
+  });
+  test('maximum balance overflow is an audited rejection with no partial credit', async () => {
+    const w = await wallet('9999999999999999.99');
+    const result = await submit(input(w, 'WIN', '0.01'));
+    expect(result.failureCode).toBe('BALANCE_LIMIT_EXCEEDED');
+    expect(result.status).toBe('REJECTED');
+    expect(result.balance.amount).toBe('9999999999999999.99');
+    expect((await service.getWallet(w.id)).version).toBe(1);
+    expect((await consistent(w.id)).checkedEntries).toBe(1);
+  });
+  test('same player can have different currencies but not a duplicate currency', async () => {
+    const w = await wallet();
+    const usd = await service.createWallet(
+      { playerId: w.playerId, initialBalance: { amount: '1.00', currency: 'USD' } },
+      context,
+    );
+    expect(usd.id).not.toBe(w.id);
+    expect(usd.balance.currency).toBe('USD');
+    await consistent(w.id);
+    await consistent(usd.id);
+  });
+  test('concurrent distinct refunds of one BET create only one credit', async () => {
+    const w = await wallet(),
+      bet = input(w);
+    await submit(bet);
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        submit(input(w, 'REFUND', '10.00', bet.externalTransactionId)),
+      ),
+    );
+    expect(results.filter((r) => r.status === 'PROCESSED')).toHaveLength(1);
+    expect(results.filter((r) => r.failureCode === 'ALREADY_REVERSED')).toHaveLength(19);
+    expect((await service.getWallet(w.id)).balance.amount).toBe('100.00');
+    expect((await consistent(w.id)).checkedEntries).toBe(3);
+  });
+  test('conflicting key across different wallets never moves both balances', async () => {
+    const a = await wallet(),
+      b = await wallet(),
+      key = crypto.randomUUID();
+    const results = await Promise.allSettled([submit(input(a), key), submit(input(b), key)]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((r) => r.status === 'rejected');
+    expect(rejected?.status === 'rejected' && rejected.reason.code).toBe('IDEMPOTENCY_CONFLICT');
+    const balances = await Promise.all([service.getWallet(a.id), service.getWallet(b.id)]);
+    expect(balances.map((w) => w.balance.amount).sort()).toEqual(['100.00', '90.00']);
+    await consistent(a.id);
+    await consistent(b.id);
+  });
+  test('pending inbox replay reflects final result after reference recovery', async () => {
+    const w = await wallet(),
+      bet = input(w),
+      refund = input(w, 'REFUND', '10.00', bet.externalTransactionId);
+    const ctx = { ...context, messageId: crypto.randomUUID() };
+    expect((await service.submit(refund, refund.externalTransactionId, ctx)).status).toBe(
+      'PENDING_REFERENCE',
+    );
+    await submit(bet);
+    await orm.em
+      .fork()
+      .execute(
+        'UPDATE wager_transactions SET next_attempt_at=now() WHERE wallet_id=? AND status=?',
+        [w.id, 'PENDING_REFERENCE'],
+      );
+    await service.retryReferences();
+    const replay = await service.submit(refund, refund.externalTransactionId, ctx);
+    expect(replay.status).toBe('PROCESSED');
+    expect(replay.idempotentReplay).toBe(true);
+    expect(replay.balance.amount).toBe('100.00');
+    expect((await consistent(w.id)).checkedEntries).toBe(3);
+  });
+  test('reconciliation reports corruption without silently repairing the balance', async () => {
+    const w = await wallet();
+    // Deliberately bypass constraints only in this disposable test database.
+    async function forceBalance(amount: string) {
+      await orm.em.fork().transactional(async (em) => {
+        await em.execute('SET LOCAL session_replication_role=replica');
+        await em.execute('UPDATE wallets SET balance=? WHERE id=?', [amount, w.id]);
+      });
+    }
+    try {
+      await forceBalance('90.00');
+      const result = await service.reconcile(w.id, context);
+      expect(result.consistent).toBe(false);
+      expect(result.difference.amount).toBe('-10.00');
+      expect(result.calculatedBalance.amount).toBe('100.00');
+      expect((await service.getWallet(w.id)).balance.amount).toBe('90.00');
+      const metricsResponse = await fetch(`${base}/metrics`);
+      expect(await metricsResponse.text()).toContain('wager_reconciliation_mismatches_total 1');
+    } finally {
+      await forceBalance('100.00');
+    }
+    await consistent(w.id);
+  });
+  test('SQS outage fails readiness but keeps liveness available', async () => {
+    const endpoint = process.env.SQS_ENDPOINT;
+    process.env.SQS_ENDPOINT = 'http://127.0.0.1:1';
+    const unavailable = new Queues();
+    if (endpoint === undefined) delete process.env.SQS_ENDPOINT;
+    else process.env.SQS_ENDPOINT = endpoint;
+    Object.assign(unavailable, { input: queues.input, events: queues.events, dlq: queues.dlq });
+    const api = await createApi(service, unavailable);
+    try {
+      await api.listen(0, '127.0.0.1');
+      const url = await api.getUrl();
+      expect((await fetch(`${url}/health/live`)).status).toBe(200);
+      expect((await fetch(`${url}/health/ready`)).status).toBe(503);
+    } finally {
+      await api.close();
+      unavailable.close();
+    }
+    expect((await fetch(`${base}/health/ready`)).status).toBe(200);
+  });
+  test('unreachable PostgreSQL returns 503 for readiness and financial requests', async () => {
+    const { MikroORM } = await import('@mikro-orm/postgresql');
+    const unavailable = await MikroORM.init({
+      ...orm.config.getAll(),
+      clientUrl: 'postgresql://jungle:jungle@127.0.0.1:1/jungle',
+      host: '127.0.0.1',
+      port: 1,
+      connect: false,
+      pool: { min: 0, max: 1, acquireTimeoutMillis: 1000 },
+    });
+    const api = await createApi(new WageringService(unavailable), queues);
+    try {
+      await api.listen(0, '127.0.0.1');
+      const url = await api.getUrl();
+      expect((await fetch(`${url}/health/live`)).status).toBe(200);
+      expect((await fetch(`${url}/health/ready`)).status).toBe(503);
+      const response = await fetch(`${url}/wallets`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          playerId: crypto.randomUUID(),
+          initialBalance: { amount: '1.00', currency: 'BRL' },
+        }),
+      });
+      expect(response.status).toBe(503);
+      expect((await response.json()).code).toBe('TEMPORARY_UNAVAILABLE');
+    } finally {
+      await api.close();
+      await unavailable.close();
+    }
+  });
+  test('real lock timeout returns HTTP 503 and allows retry with the same key', async () => {
+    const w = await wallet(),
+      p = input(w);
+    let unlock!: () => void, locked!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    const acquired = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const holding = orm.em.fork().transactional(async (em) => {
+      await em.execute('SELECT id FROM wallets WHERE id=? FOR UPDATE', [w.id]);
+      locked();
+      await gate;
+    });
+    await acquired;
+    try {
+      const response = await fetch(`${base}/wagering/transactions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'Idempotency-Key': p.externalTransactionId },
+        body: JSON.stringify(p),
+      });
+      expect(response.status).toBe(503);
+      expect((await response.json()).code).toBe('TEMPORARY_UNAVAILABLE');
+      expect((await service.getWallet(w.id)).balance.amount).toBe('100.00');
+    } finally {
+      unlock();
+      await holding;
+    }
+    expect((await submit(p)).status).toBe('PROCESSED');
+    expect((await consistent(w.id)).calculatedBalance.amount).toBe('90.00');
+  });
+  test('SIGTERM completes a message already waiting on a wallet lock', async () => {
+    const prefix = 'shutdown-' + crypto.randomUUID().slice(0, 8) + '-';
+    const previous = process.env.QUEUE_PREFIX;
+    process.env.QUEUE_PREFIX = prefix;
+    const isolated = new Queues();
+    try {
+      await isolated.initialize();
+    } finally {
+      if (previous === undefined) delete process.env.QUEUE_PREFIX;
+      else process.env.QUEUE_PREFIX = previous;
+    }
+    const w = await wallet(),
+      p = input(w),
+      messageId = crypto.randomUUID();
+    const url = new URL(process.env.DATABASE_URL!);
+    let unlock!: () => void, locked!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    const acquired = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const holding = orm.em.fork().transactional(async (em) => {
+      await em.execute('SELECT id FROM wallets WHERE id=? FOR UPDATE', [w.id]);
+      locked();
+      await gate;
+    });
+    await acquired;
+    const childProcess = Bun.spawn([process.execPath, 'src/worker.ts'], {
+      env: {
+        ...process.env,
+        QUEUE_PREFIX: prefix,
+        DATABASE_URL: url.toString(),
+        WORKER_HEALTH_PORT: '0',
+      },
+      stdout: 'ignore',
+      stderr: 'pipe',
+    });
+    try {
+      await isolated.client.send(
+        new SendMessageCommand({
+          QueueUrl: isolated.input,
+          MessageGroupId: w.id,
+          MessageDeduplicationId: messageId,
+          MessageBody: JSON.stringify({
+            messageId,
+            type: 'WagerTransactionRequested',
+            occurredAt: new Date().toISOString(),
+            data: { ...p, idempotencyKey: p.externalTransactionId },
+          }),
+        }),
+      );
+      await waitFor(
+        async () =>
+          (
+            await orm.em
+              .fork()
+              .execute(
+                "SELECT pid FROM pg_stat_activity WHERE datname=? AND wait_event_type='Lock' AND query LIKE '%FROM wallets%FOR UPDATE%'",
+                [testDatabase],
+              )
+          ).length > 0,
+      );
+      childProcess.kill('SIGTERM');
+      unlock();
+      await holding;
+      await waitFor(async () => childProcess.exitCode !== null, 15000);
+      expect(await childProcess.exited).toBe(0);
+      expect((await consistent(w.id)).calculatedBalance.amount).toBe('90.00');
+      expect(
+        await orm.em
+          .fork()
+          .execute('SELECT message_id FROM inbox WHERE message_id=? AND processed_at IS NOT NULL', [
+            messageId,
+          ]),
+      ).toHaveLength(1);
+      const remaining = await isolated.client.send(
+        new ReceiveMessageCommand({ QueueUrl: isolated.input, WaitTimeSeconds: 1 }),
+      );
+      expect(remaining.Messages ?? []).toHaveLength(0);
+    } finally {
+      unlock();
+      await holding;
+      if (childProcess.exitCode === null) childProcess.kill('SIGKILL');
+      await childProcess.exited;
+      await Promise.all(
+        [isolated.input, isolated.events, isolated.dlq].map((QueueUrl) =>
+          isolated.client.send(new DeleteQueueCommand({ QueueUrl })),
+        ),
+      );
+      isolated.close();
+    }
   });
 });

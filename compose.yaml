@@ -1,0 +1,61 @@
+name: jungle-challenge
+x-app: &app
+  build: .
+  environment: &env
+    DATABASE_URL: postgresql://jungle:jungle@postgres:5432/jungle
+    SQS_ENDPOINT: http://localstack:4566
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    PORT: 3000
+    REFERENCE_TTL_SECONDS: ${REFERENCE_TTL_SECONDS:-300}
+    REFERENCE_MAX_ATTEMPTS: ${REFERENCE_MAX_ATTEMPTS:-10}
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    localstack:
+      condition: service_healthy
+  init: true
+  stop_grace_period: 35s
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: jungle
+      POSTGRES_PASSWORD: jungle
+      POSTGRES_DB: jungle
+    ports: ['55432:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U jungle -d jungle']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  localstack:
+    image: localstack/localstack:4.8.1
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: dynamic
+    ports: ['4566:4566']
+    healthcheck:
+      test: ['CMD-SHELL', 'awslocal sqs list-queues >/dev/null']
+      interval: 3s
+      timeout: 5s
+      retries: 40
+  migrate:
+    <<: *app
+    command: ['bun', 'scripts/migrate.ts', 'up']
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    <<: *app
+    restart: unless-stopped
+    ports: ['3000:3000']
+  worker:
+    <<: *app
+    restart: unless-stopped
+    command: ['bun', 'src/worker.ts']
+volumes:
+  pgdata:

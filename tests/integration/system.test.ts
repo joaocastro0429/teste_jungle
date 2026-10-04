@@ -11,7 +11,7 @@ import {
 } from '../../src/infrastructure/queues';
 import { Workers } from '../../src/infrastructure/workers';
 import type { WagerInput } from '../../src/domain/transaction';
-import { DeleteQueueCommand } from '@aws-sdk/client-sqs';
+import { DeleteQueueCommand, GetQueueAttributesCommand } from '@aws-sdk/client-sqs';
 import { createApi } from '../../src/http/api';
 import type { INestApplication } from '@nestjs/common';
 let adminOrm: MikroORM;
@@ -861,6 +861,14 @@ describe('Additional failure and audit guarantees', () => {
         new ReceiveMessageCommand({ QueueUrl: isolated.input, WaitTimeSeconds: 1 }),
       );
       expect(remaining.Messages ?? []).toHaveLength(0);
+      const attributes = await isolated.client.send(
+        new GetQueueAttributesCommand({
+          QueueUrl: isolated.input,
+          AttributeNames: ['ApproximateNumberOfMessagesNotVisible'],
+        }),
+      );
+      // An empty receive alone could mean the message is still invisible, rather than acked.
+      expect(Number(attributes.Attributes?.ApproximateNumberOfMessagesNotVisible)).toBe(0);
     } finally {
       unlock();
       await holding;

@@ -2,7 +2,20 @@
 
 Implementação do [desafio backend da Jungle Gaming](https://github.com/junglegaming/backend-challenge), com Bun 1.x, NestJS, TypeScript estrito, MikroORM, PostgreSQL e SQS via LocalStack.
 
-## Executar com Docker
+## Baixar o projeto
+
+Instale o [Git](https://git-scm.com/downloads) e o [Docker com Docker Compose](https://docs.docker.com/get-started/get-docker/). Inicie o Docker antes de executar os comandos abaixo. Para executar tudo com Docker, não é necessário instalar Bun, Node.js ou PostgreSQL na sua máquina.
+
+No terminal, baixe o repositório e entre na pasta:
+
+```bash
+git clone https://github.com/joaocastro0429/teste_jungle.git
+cd teste_jungle
+```
+
+Se preferir baixar sem Git, abra o [repositório no GitHub](https://github.com/joaocastro0429/teste_jungle), clique em **Code → Download ZIP**, extraia o arquivo e abra um terminal dentro da pasta extraída.
+
+## Instalar e executar com Docker
 
 Requer Docker com Compose. Na raiz:
 
@@ -12,6 +25,17 @@ curl http://localhost:3000/health/ready
 ```
 
 O serviço `migrate` aplica a migration antes de iniciar a API e o worker. A API fica em `http://localhost:3000`; PostgreSQL em `localhost:55432`; LocalStack em `localhost:4566`. As filas são criadas automaticamente. Aguarde o health retornar `ready`.
+
+O primeiro comando instala as dependências na imagem e inicia os serviços. A primeira execução pode demorar enquanto as imagens são baixadas. As portas `3000`, `55432` e `4566` precisam estar livres. Se o health ainda não responder, repita a consulta após alguns segundos. A resposta esperada é `{"status":"ready"}`.
+
+Para verificar a aplicação na prática:
+
+```bash
+docker compose exec api bun run demo
+docker compose exec api bun scripts/test-api.ts
+```
+
+A demo e o teste da API criam carteiras novas e verificam operações financeiras; esses dados ficam disponíveis para consulta no banco local.
 
 ```bash
 docker compose logs -f api worker
